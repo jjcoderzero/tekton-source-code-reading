@@ -1,0 +1,219 @@
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: publish-tekton-pipelines
+spec:
+  params:
+  - name: versionTag
+    description: The vX.Y.Z version that the artifacts should be tagged with (including `v`)
+  - name: imageRegistry
+    description: TODO(#569) This is a hack to make it easy for folks to switch the registry being used by the many many image outputs
+  - name: pathToProject
+    description: The path to the folder in the go/src dir that contains the project, which is used by `ko` to name the resulting images
+  - name: releaseAsLatest
+    description: Whether to tag and publish this release as Pipelines' latest
+    default: "true"
+  - name: platforms
+    description: Platforms to publish for the images (e.g. linux/amd64,linux/arm64)
+    default: linux/amd64,linux/arm64,linux/s390x,linux/ppc64le
+  resources:
+    inputs:
+    - name: source
+      type: git
+      targetPath: go/src/github.com/tektoncd/pipeline
+    - name: bucket
+      type: storage
+    outputs:
+    - name: bucket
+      type: storage
+    - name: builtEntrypointImage
+      type: image
+    - name: builtNopImage
+      type: image
+    - name: builtKubeconfigWriterImage
+      type: image
+    - name: builtGitInitImage
+      type: image
+    - name: builtControllerImage
+      type: image
+    - name: builtWebhookImage
+      type: image
+    - name: builtDigestExporterImage
+      type: image
+    - name: builtPullRequestInitImage
+      type: image
+    - name: builtGcsFetcherImage
+      type: image
+    - name: notification
+      type: cloudEvent
+  steps:
+
+  - name: create-ko-yaml
+    image: busybox
+    script: |
+      #!/bin/sh
+      set -ex
+
+      cat <<EOF > /workspace/go/src/github.com/tektoncd/pipeline/.ko.yaml
+      # This matches the value configured in .ko.yaml
+      defaultBaseImage: gcr.io/distroless/static:nonroot
+      baseImageOverrides:
+        $(params.pathToProject)/$(resources.outputs.builtGitInitImage.url): $(params.imageRegistry)/$(params.pathToProject)/build-base:latest
+
+        # These match values configured in .ko.yaml
+        $(params.pathToProject)/$(resources.outputs.builtEntrypointImage.url): gcr.io/distroless/base:debug-nonroot
+        $(params.pathToProject)/$(resources.outputs.builtGcsFetcherImage.url): gcr.io/distroless/static:latest
+        $(params.pathToProject)/$(resources.outputs.builtPullRequestInitImage.url): gcr.io/distroless/static:latest
+      EOF
+
+      cat /workspace/go/src/github.com/tektoncd/pipeline/.ko.yaml
+
+  - name: link-input-bucket-to-output
+    image: busybox
+    command: ["cp"]
+    args:
+    - -r
+    - "/workspace/bucket"
+    - "/workspace/output/"
+
+  - name: ensure-release-dir-exists
+    image: busybox
+    command: ["mkdir"]
+    args:
+    - "-p"
+    - "/workspace/output/bucket/previous/$(params.versionTag)/"
+
+  - name: run-ko
+    image: gcr.io/tekton-releases/dogfooding/ko-gcloud:latest
+    env:
+    - name: KO_DOCKER_REPO
+      value: $(params.imageRegistry)
+    - name: GOPATH
+      value: /workspace/go
+    - name: GO111MODULE
+      value: "off"
+    - name: GOFLAGS
+      value: "-mod=vendor"
+    - name: GOOGLE_APPLICATION_CREDENTIALS
+      value: "/secret/release.json"
+    script: |
+      #!/usr/bin/env bash
+      set -ex
+
+      # Activate service account
+      gcloud auth activate-service-account --key-file=${GOOGLE_APPLICATION_CREDENTIALS}
+
+      # Setup docker-auth
+      gcloud auth configure-docker
+
+      # Change to directory with our .ko.yaml
+      cd /workspace/go/src/github.com/tektoncd/pipeline
+
+      # For each cmd/* directory, include a full gzipped tar of all source in
+      # vendor/. This is overkill. Some deps' licenses require the source to be
+      # included in the container image when they're used as a dependency.
+      # Rather than trying to determine which deps have this requirement (and
+      # probably get it wrong), we'll just targz up the whole vendor tree and
+      # include it. As of 9/20/2019, this amounts to about 11MB of additional
+      # data in each image.
+      TMPDIR=$(mktemp -d)
+      tar cfz ${TMPDIR}/source.tar.gz vendor/
+      for d in cmd/*; do
+        ln -s ${TMPDIR}/source.tar.gz ${d}/kodata/
+      done
+
+      # Rewrite "devel" to params.versionTag
+      sed -i -e 's/\(pipeline.tekton.dev\/release\): "devel"/\1: "$(params.versionTag)"/g' -e 's/\(app.kubernetes.io\/version\): "devel"/\1: "$(params.versionTag)"/g' -e 's/\(version\): "devel"/\1: "$(params.versionTag)"/g' -e 's/\("-version"\), "devel"/\1, "$(params.versionTag)"/g' /workspace/go/src/github.com/tektoncd/pipeline/config/*.yaml
+
+      OUTPUT_BUCKET_RELEASE_DIR="/workspace/output/bucket/previous/$(params.versionTag)"
+
+      # Publish images and create release.yaml
+      ko resolve --platform=$(params.platforms) --preserve-import-paths -t $(params.versionTag) -f /workspace/go/src/github.com/tektoncd/pipeline/config/ > $OUTPUT_BUCKET_RELEASE_DIR/release.yaml
+      # Publish images and create release.notags.yaml
+      # This is useful if your container runtime doesn't support the `image-reference:tag@digest` notation
+      # This is currently the case for `cri-o` (and most likely others)
+      ko resolve --platform=$(params.platforms) --preserve-import-paths -f /workspace/go/src/github.com/tektoncd/pipeline/config/ > $OUTPUT_BUCKET_RELEASE_DIR/release.notags.yaml
+    volumeMounts:
+      - name: gcp-secret
+        mountPath: /secret
+
+  - name: copy-to-latest-bucket
+    image: busybox
+    workingDir: "/workspace/output/bucket"
+    script: |
+      #!/bin/sh
+      set -ex
+
+      if [[ "$(params.releaseAsLatest)" == "true" ]]
+      then
+        mkdir -p "/workspace/output/bucket/latest/"
+        OUTPUT_BUCKET_RELEASE_DIR="/workspace/output/bucket/previous/$(params.versionTag)"
+        OUTPUT_BUCKET_LATEST_DIR="/workspace/output/bucket/latest"
+        cp "$OUTPUT_BUCKET_RELEASE_DIR/release.yaml" "$OUTPUT_BUCKET_LATEST_DIR/release.yaml"
+        cp "$OUTPUT_BUCKET_RELEASE_DIR/release.notags.yaml" "$OUTPUT_BUCKET_LATEST_DIR/release.notags.yaml"
+      fi
+
+  - name: tag-images
+    image: gcr.io/go-containerregistry/crane:debug
+    script: |
+      #!/usr/bin/env bash
+      set -ex
+
+      REGIONS=(us eu asia)
+      IMAGES=(
+        $(params.imageRegistry)/$(params.pathToProject)/$(resources.outputs.builtEntrypointImage.url):$(params.versionTag)
+        $(params.imageRegistry)/$(params.pathToProject)/$(resources.outputs.builtNopImage.url):$(params.versionTag)
+        $(params.imageRegistry)/$(params.pathToProject)/$(resources.outputs.builtKubeconfigWriterImage.url):$(params.versionTag)
+        $(params.imageRegistry)/$(params.pathToProject)/$(resources.outputs.builtGitInitImage.url):$(params.versionTag)
+        $(params.imageRegistry)/$(params.pathToProject)/$(resources.outputs.builtControllerImage.url):$(params.versionTag)
+        $(params.imageRegistry)/$(params.pathToProject)/$(resources.outputs.builtWebhookImage.url):$(params.versionTag)
+        $(params.imageRegistry)/$(params.pathToProject)/$(resources.outputs.builtDigestExporterImage.url):$(params.versionTag)
+        $(params.imageRegistry)/$(params.pathToProject)/$(resources.outputs.builtPullRequestInitImage.url):$(params.versionTag)
+        $(params.imageRegistry)/$(params.pathToProject)/$(resources.outputs.builtGcsFetcherImage.url):$(params.versionTag)
+      )
+      # Parse the built images from the release.yaml generated by ko
+      BUILT_IMAGES=( $(/workspace/go/src/github.com/tektoncd/pipeline/tekton/koparse/koparse.py --path /workspace/output/bucket/previous/$(params.versionTag)/release.yaml --base $(params.imageRegistry)/$(params.pathToProject) --images ${IMAGES[@]}) )
+
+      # Auth with account credentials for all regions.
+      HOSTNAME=gcr.io
+      cat /secret/release.json | crane auth login -u _json_key --password-stdin https://${HOSTNAME}
+      for REGION in "${REGIONS[@]}"
+      do
+        HOSTNAME=${REGION}.gcr.io
+        cat /secret/release.json | crane auth login -u _json_key --password-stdin https://${HOSTNAME}
+      done
+
+      # Tag the images and put them in all the regions
+      for IMAGE in "${BUILT_IMAGES[@]}"
+      do
+        IMAGE_WITHOUT_SHA=${IMAGE%%@*}
+        IMAGE_WITHOUT_SHA_AND_TAG=${IMAGE_WITHOUT_SHA%%:*}
+        IMAGE_WITH_SHA=${IMAGE_WITHOUT_SHA_AND_TAG}@${IMAGE##*@}
+
+        if [[ "$(params.releaseAsLatest)" == "true" ]]
+        then
+          crane cp ${IMAGE_WITH_SHA} ${IMAGE_WITHOUT_SHA_AND_TAG}:latest
+        fi
+
+        for REGION in "${REGIONS[@]}"
+        do
+          if [[ "$(params.releaseAsLatest)" == "true" ]]
+          then
+            for TAG in "latest" $(params.versionTag)
+            do
+              crane cp ${IMAGE_WITH_SHA} ${REGION}.${IMAGE_WITHOUT_SHA_AND_TAG}:$TAG
+            done
+          else
+            TAG="$(params.versionTag)"
+            crane cp ${IMAGE_WITH_SHA} ${REGION}.${IMAGE_WITHOUT_SHA_AND_TAG}:$TAG
+          fi
+        done
+      done
+    volumeMounts:
+      - name: gcp-secret
+        mountPath: /secret
+
+  volumes:
+    - name: gcp-secret
+      secret:
+        secretName: release-secret
